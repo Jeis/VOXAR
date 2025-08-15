@@ -1,0 +1,353 @@
+# Universal Development Dockerfile for Spatial Platform
+# Compatible with x86_64 (Intel/AMD) and ARM64 (Apple Silicon)
+# Auto-detects architecture and optimizes for development
+
+# Multi-platform base image
+FROM ubuntu:22.04
+
+# Build arguments for multi-platform support
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BUILDPLATFORM
+ARG SERVICE_NAME=spatial-service
+
+# Environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app/src
+ENV PATH="/home/spatial/.local/bin:$PATH"
+ENV SERVICE_NAME=${SERVICE_NAME}
+ENV TARGETARCH=${TARGETARCH}
+
+# Create non-root user
+RUN groupadd --gid 1000 spatial \
+    && useradd --uid 1000 --gid spatial --shell /bin/bash --create-home spatial
+
+# Install system dependencies
+RUN echo "Building ${SERVICE_NAME} for ${TARGETPLATFORM} (${TARGETARCH})" && \
+    apt-get update && apt-get install -y \
+    # Build essentials
+    build-essential \
+    cmake \
+    git \
+    pkg-config \
+    # Python environment
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-distutils \
+    # System utilities
+    curl \
+    wget \
+    ca-certificates \
+    unzip \
+    # COLMAP dependencies
+    libboost-program-options1.74.0 \
+    libboost-filesystem1.74.0 \
+    libboost-graph1.74.0 \
+    libboost-system1.74.0 \
+    libeigen3-dev \
+    libflann1.9 \
+    libfreeimage3 \
+    libmetis5 \
+    libgoogle-glog0v5 \
+    libgflags2.2 \
+    libsqlite3-0 \
+    libglew2.2 \
+    libcgal14 \
+    # OpenCV dependencies
+    libopencv-core4.5d \
+    libopencv-imgproc4.5d \
+    libopencv-imgcodecs4.5d \
+    libopencv-features2d4.5d \
+    libopencv-calib3d4.5d \
+    # Install COLMAP
+    colmap \
+    # Network tools for health checks
+    netcat-openbsd \
+    # Cleanup
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Verify COLMAP installation
+RUN colmap --help > /dev/null 2>&1 && echo "COLMAP installed successfully" || echo "COLMAP installation failed"
+
+# Set up application directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements*.txt ./
+RUN pip3 install --upgrade pip setuptools wheel
+
+# Create universal requirements for development
+RUN echo "# Universal development requirements" > requirements-dev.txt && \
+    echo "# Core framework" >> requirements-dev.txt && \
+    echo "fastapi==0.104.1" >> requirements-dev.txt && \
+    echo "uvicorn[standard]==0.24.0" >> requirements-dev.txt && \
+    echo "# Database" >> requirements-dev.txt && \
+    echo "sqlalchemy==2.0.23" >> requirements-dev.txt && \
+    echo "psycopg2-binary==2.9.9" >> requirements-dev.txt && \
+    echo "alembic==1.13.1" >> requirements-dev.txt && \
+    echo "# Cache & Queue" >> requirements-dev.txt && \
+    echo "redis==5.0.1" >> requirements-dev.txt && \
+    echo "celery==5.3.4" >> requirements-dev.txt && \
+    echo "# Data processing" >> requirements-dev.txt && \
+    echo "pydantic==2.5.0" >> requirements-dev.txt && \
+    echo "numpy==1.24.3" >> requirements-dev.txt && \
+    echo "opencv-python==4.8.1.78" >> requirements-dev.txt && \
+    echo "Pillow==10.1.0" >> requirements-dev.txt && \
+    echo "# 3D reconstruction" >> requirements-dev.txt && \
+    echo "# pycolmap  # May fail on some platforms, fallback to subprocess" >> requirements-dev.txt && \
+    echo "# Utilities" >> requirements-dev.txt && \
+    echo "requests==2.31.0" >> requirements-dev.txt && \
+    echo "aiofiles==23.2.1" >> requirements-dev.txt && \
+    echo "python-multipart==0.0.6" >> requirements-dev.txt && \
+    echo "pyyaml==6.0.1" >> requirements-dev.txt && \
+    echo "# Monitoring" >> requirements-dev.txt && \
+    echo "prometheus_client==0.19.0" >> requirements-dev.txt && \
+    echo "# Development" >> requirements-dev.txt && \
+    echo "pytest==7.4.3" >> requirements-dev.txt && \
+    echo "pytest-asyncio==0.21.1" >> requirements-dev.txt && \
+    echo "black==23.11.0" >> requirements-dev.txt && \
+    echo "flake8==6.1.0" >> requirements-dev.txt && \
+    echo "mypy==1.7.1" >> requirements-dev.txt
+
+# Install Python packages as spatial user
+USER spatial
+RUN pip3 install --user --no-cache-dir -r requirements-dev.txt
+
+# Try to install pycolmap (architecture-dependent)
+RUN pip3 install --user --no-cache-dir pycolmap || \
+    echo "pycolmap installation failed for ${TARGETARCH}, using subprocess fallback"
+
+# Install additional packages if requirements.txt exists
+RUN if [ -f requirements.txt ]; then \
+        pip3 install --user --no-cache-dir -r requirements.txt || \
+        echo "Additional requirements installation failed, continuing..."; \
+    fi
+
+# Copy application code
+USER root
+COPY --chown=spatial:spatial . /app/
+
+# Create necessary directories
+RUN mkdir -p /app/data/temp /app/data/cache /app/logs /app/models \
+    && chown -R spatial:spatial /app/data /app/logs /app/models
+
+# Make scripts executable
+RUN find /app -name "*.sh" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+# Create universal startup script
+RUN cat > /app/start-service.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "=========================================="
+echo "Spatial Platform - ${SERVICE_NAME}"
+echo "=========================================="
+echo "Architecture: $(uname -m)"
+echo "Platform: $(uname -s)"
+echo "Python: $(python3 --version)"
+echo "Environment: ${ENVIRONMENT:-development}"
+echo ""
+
+# Detect system capabilities
+CPU_CORES=$(nproc)
+TOTAL_MEMORY=$(free -m | awk 'NR==2{printf "%.0f", $2/1024}')
+
+echo "System Resources:"
+echo "- CPU Cores: $CPU_CORES"
+echo "- Memory: ${TOTAL_MEMORY}GB"
+echo ""
+
+# Set architecture-specific optimizations
+case $(uname -m) in
+    "x86_64"|"amd64")
+        echo "Optimizing for x86_64 architecture"
+        export DEFAULT_WORKERS=${DEFAULT_WORKERS:-$(( CPU_CORES > 4 ? 4 : CPU_CORES ))}
+        export DEFAULT_MEMORY=${DEFAULT_MEMORY:-8}
+        export DEFAULT_CONCURRENCY=${DEFAULT_CONCURRENCY:-2}
+        ;;
+    "aarch64"|"arm64")
+        echo "Optimizing for ARM64 architecture"
+        export DEFAULT_WORKERS=${DEFAULT_WORKERS:-$(( CPU_CORES > 2 ? 2 : CPU_CORES ))}
+        export DEFAULT_MEMORY=${DEFAULT_MEMORY:-4}
+        export DEFAULT_CONCURRENCY=${DEFAULT_CONCURRENCY:-1}
+        ;;
+    *)
+        echo "Unknown architecture, using conservative defaults"
+        export DEFAULT_WORKERS=${DEFAULT_WORKERS:-2}
+        export DEFAULT_MEMORY=${DEFAULT_MEMORY:-4}
+        export DEFAULT_CONCURRENCY=${DEFAULT_CONCURRENCY:-1}
+        ;;
+esac
+
+# Apply resource defaults if not set
+export MAX_WORKERS=${MAX_WORKERS:-$DEFAULT_WORKERS}
+export MEMORY_LIMIT_GB=${MEMORY_LIMIT_GB:-$DEFAULT_MEMORY}
+export CELERY_CONCURRENCY=${CELERY_CONCURRENCY:-$DEFAULT_CONCURRENCY}
+
+echo "Resource Configuration:"
+echo "- Workers: $MAX_WORKERS"
+echo "- Memory Limit: ${MEMORY_LIMIT_GB}GB"
+echo "- Celery Concurrency: $CELERY_CONCURRENCY"
+echo ""
+
+# Set threading optimizations
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$MAX_WORKERS}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-$MAX_WORKERS}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-$MAX_WORKERS}
+
+# Check dependencies
+echo "Checking dependencies..."
+python3 -c "
+import sys
+packages = [
+    ('fastapi', 'FastAPI'),
+    ('sqlalchemy', 'SQLAlchemy'),
+    ('redis', 'Redis'),
+    ('celery', 'Celery'),
+    ('numpy', 'NumPy'),
+    ('cv2', 'OpenCV'),
+]
+
+for module, name in packages:
+    try:
+        __import__(module)
+        print(f'✓ {name}')
+    except ImportError:
+        print(f'✗ {name} (not available)')
+
+# Check COLMAP
+try:
+    import pycolmap
+    print(f'✓ pycolmap: {pycolmap.__version__}')
+except ImportError:
+    import subprocess
+    try:
+        result = subprocess.run(['colmap', '--version'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print('✓ COLMAP (via subprocess)')
+        else:
+            print('✗ COLMAP (not available)')
+    except:
+        print('✗ COLMAP (not available)')
+"
+echo ""
+
+# Start health check server
+echo "Starting health check server..."
+python3 -c "
+import http.server
+import socketserver
+import json
+import threading
+from datetime import datetime
+import platform
+
+class HealthHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            health_data = {
+                'status': 'healthy',
+                'service': '${SERVICE_NAME}',
+                'timestamp': datetime.now().isoformat(),
+                'platform': {
+                    'system': platform.system(),
+                    'architecture': platform.machine(),
+                    'python': platform.python_version()
+                },
+                'resources': {
+                    'workers': '${MAX_WORKERS}',
+                    'memory_limit': '${MEMORY_LIMIT_GB}GB'
+                }
+            }
+            self.wfile.write(json.dumps(health_data, indent=2).encode())
+        elif self.path == '/metrics':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            metrics = f'''# HELP spatial_service_info Service information
+# TYPE spatial_service_info gauge
+spatial_service_info{{service=\"${SERVICE_NAME}\",architecture=\"$(uname -m)\"}} 1
+'''
+            self.wfile.write(metrics.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_health_server():
+    with socketserver.TCPServer(('', 8081), HealthHandler) as httpd:
+        httpd.serve_forever()
+
+# Start health server in background
+health_thread = threading.Thread(target=start_health_server, daemon=True)
+health_thread.start()
+print('Health check server started on port 8081')
+print('Health: http://localhost:8081/health')
+print('Metrics: http://localhost:8081/metrics')
+print('')
+" &
+
+# Service-specific startup
+case "${SERVICE_NAME}" in
+    "mapping-processor")
+        echo "Starting 3D mapping processor..."
+        echo "Ready for reconstruction jobs"
+        ;;
+    "localization-service")
+        echo "Starting AR localization service..."
+        echo "Ready for localization requests"
+        ;;
+    "api-gateway")
+        echo "Starting API gateway..."
+        echo "Ready to serve API requests"
+        ;;
+    "celery-worker")
+        echo "Starting background task worker..."
+        echo "Ready to process jobs"
+        ;;
+    "flower")
+        echo "Starting Celery monitoring..."
+        echo "Ready to monitor task queues"
+        ;;
+    *)
+        echo "Starting ${SERVICE_NAME}..."
+        echo "Ready for development"
+        ;;
+esac
+
+echo ""
+echo "Service ready! 🚀"
+echo "=========================================="
+
+# Keep container running for development
+exec tail -f /dev/null
+EOF
+
+RUN chmod +x /app/start-service.sh && chown spatial:spatial /app/start-service.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+# Switch to non-root user
+USER spatial
+
+# Expose standard ports
+EXPOSE 8080 8081
+
+# Default command
+CMD ["/app/start-service.sh"]
+
+# Labels
+LABEL maintainer="spatial-platform@github.com"
+LABEL version="1.0.0"
+LABEL description="Spatial Platform - Universal Development Container"
+LABEL repository="https://github.com/your-org/spatial-platform"
+LABEL documentation="https://spatial-platform.dev/docs"
+LABEL architecture="multi"

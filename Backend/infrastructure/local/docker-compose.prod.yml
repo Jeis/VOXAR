@@ -1,0 +1,105 @@
+# Spatial Platform - Production Environment
+# Simple deployment for end users
+
+services:
+  # PostgreSQL database with PostGIS
+  postgres:
+    image: postgis/postgis:15-3.3-alpine
+    container_name: spatial-postgres
+    environment:
+      POSTGRES_DB: spatial_platform
+      POSTGRES_USER: spatial_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: spatial-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-change_me_in_production}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # Object storage
+  minio:
+    image: minio/minio:latest
+    container_name: spatial-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-spatial_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-change_me_in_production}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  # API Gateway (Production Image)
+  api-gateway:
+    image: spatialplatform/api-gateway:latest
+    container_name: spatial-api-gateway
+    environment:
+      DATABASE_URL: postgresql://spatial_admin:${POSTGRES_PASSWORD:-change_me_in_production}@postgres:5432/spatial_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me_in_production}@redis:6379/2
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_USER:-spatial_admin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-change_me_in_production}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    restart: unless-stopped
+
+  # Localization Service (Production Image)
+  localization-service:
+    image: spatialplatform/localization-service:latest
+    container_name: spatial-localization
+    environment:
+      DATABASE_URL: postgresql://spatial_admin:${POSTGRES_PASSWORD:-change_me_in_production}@postgres:5432/spatial_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me_in_production}@redis:6379/1
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_USER:-spatial_admin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-change_me_in_production}
+    ports:
+      - "8092:8080"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    restart: unless-stopped
+
+  # 3D Mapping Processor (Production Image)
+  mapping-processor:
+    image: spatialplatform/mapping-processor:latest
+    container_name: spatial-mapping-processor
+    environment:
+      DATABASE_URL: postgresql://spatial_admin:${POSTGRES_PASSWORD:-change_me_in_production}@postgres:5432/spatial_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me_in_production}@redis:6379/0
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_USER:-spatial_admin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-change_me_in_production}
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  default:
+    driver: bridge

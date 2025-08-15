@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'spatial-platform'
+    static_configs:
+      - targets: 
+        - 'mapping-processor:8080'
+        - 'localization-service:8080'
+        - 'api-gateway:8000'
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+    
+  - job_name: 'infrastructure'
+    static_configs:
+      - targets:
+        - 'postgres:5432'
+        - 'redis:6379'
+        - 'minio:9000'
+    scrape_interval: 60s

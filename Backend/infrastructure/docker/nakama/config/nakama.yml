@@ -1,0 +1,68 @@
+name: spatial-platform-nakama
+data_dir: "/nakama/data"
+
+logger:
+  stdout: true
+  level: "INFO"
+  file: "/nakama/data/logs/nakama.log"
+
+session:
+  token_expiry_sec: 7200  # 2 hours
+  refresh_token_expiry_sec: 604800  # 7 days
+  single_session: false
+
+socket:
+  server_key: "spatial_platform_key_2024"
+  port: 7349
+  address: "0.0.0.0"
+  protocol: "tcp"
+  max_message_size_bytes: 4096
+  read_buffer_size_bytes: 4096
+  write_buffer_size_bytes: 4096
+  idle_timeout_ms: 60000
+  write_wait_ms: 5000
+  pong_wait_ms: 25000
+  ping_period_ms: 15000
+  ping_backoff_threshold: 20
+
+runtime:
+  env:
+    - "spatial_environment"
+  http_key: "spatial_http_key_2024"
+  read_only_globals: true
+  js_entrypoint: "index.js"
+
+tracker:
+  event_queue_size: 8192
+  event_queue_workers: 8
+
+match:
+  input_queue_size: 1024
+  call_queue_size: 1024
+  join_attempt_queue_size: 1024
+  defer_message_fn: ""
+  join_marker_deadline_ms: 15000
+  max_players: 8  # Max players per AR session
+
+console:
+  port: 7351
+  address: "0.0.0.0"
+  username: "spatial_admin"
+  password: "spatial_console_2024"
+  signing_key: "spatial_console_signing_key"
+  token_expiry_sec: 86400  # 24 hours
+
+cluster:
+  join: []
+  max_message_size_bytes: 4096
+
+database:
+  address:
+    - "nakama-db:5432"
+  name: "nakama"
+  user: "nakama"
+  password: "nakama"
+  ssl_mode: "disable"
+  conn_max_lifetime_ms: 3600000
+  max_idle_conns: 50
+  max_open_conns: 100
