@@ -1,0 +1,356 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Nakama AR Platform Metrics",
+    "tags": ["nakama", "ar", "spatial", "multiplayer"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 1,
+    "panels": [
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "id": 1,
+        "title": "Real-time FPS Performance",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"1\"}[1m]) * 60",
+            "legendFormat": "Pose Updates/sec",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "ops",
+            "label": "Updates per Second",
+            "show": true
+          }
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [55],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": ["A", "5m", "now"]
+              },
+              "reducer": {
+                "params": [],
+                "type": "avg"
+              },
+              "type": "query"
+            }
+          ],
+          "name": "FPS Below Target",
+          "message": "AR pose update rate has dropped below 55 FPS target"
+        }
+      },
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "id": 2,
+        "title": "Message Latency (P95)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(nakama_match_message_latency_bucket[5m]))",
+            "legendFormat": "P95 Latency",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(nakama_match_message_latency_bucket[5m]))",
+            "legendFormat": "P99 Latency",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "ms",
+            "label": "Latency",
+            "show": true
+          }
+        ],
+        "thresholds": [
+          {
+            "value": 16.67,
+            "op": "gt",
+            "fill": true,
+            "line": true,
+            "colorMode": "critical"
+          }
+        ]
+      },
+      {
+        "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+        "id": 3,
+        "title": "Active AR Sessions",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "count(nakama_match_presences{match_type=\"spatial_ar_match\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "background",
+          "orientation": "auto"
+        }
+      },
+      {
+        "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+        "id": 4,
+        "title": "Connected Users",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(nakama_match_presences{match_type=\"spatial_ar_match\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "value",
+          "orientation": "auto"
+        }
+      },
+      {
+        "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+        "id": 5,
+        "title": "Anonymous vs Authenticated",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "count(nakama_session_count{type=\"anonymous\"})",
+            "legendFormat": "Anonymous",
+            "refId": "A"
+          },
+          {
+            "expr": "count(nakama_session_count{type=\"authenticated\"})",
+            "legendFormat": "Authenticated",
+            "refId": "B"
+          }
+        ],
+        "options": {
+          "pieType": "donut",
+          "displayLabels": ["name", "percent"]
+        }
+      },
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "id": 6,
+        "title": "Spatial Anchors Created",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"2\"}[5m])",
+            "legendFormat": "Anchors/min",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "short",
+            "label": "Anchors per Minute",
+            "show": true
+          }
+        ]
+      },
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "id": 7,
+        "title": "Session Code Usage",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "topk(10, nakama_rpc_calls_total{rpc=\"create_anonymous_session\"})",
+            "format": "table",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showHeader": true
+        }
+      },
+      {
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+        "id": 8,
+        "title": "Message Type Distribution",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"1\"}[5m])",
+            "legendFormat": "Pose Updates",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"2\"}[5m])",
+            "legendFormat": "Anchor Create",
+            "refId": "B"
+          },
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"3\"}[5m])",
+            "legendFormat": "Anchor Update",
+            "refId": "C"
+          },
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"5\"}[5m])",
+            "legendFormat": "Colocalization",
+            "refId": "D"
+          },
+          {
+            "expr": "rate(nakama_match_messages_total{match_type=\"spatial_ar_match\", op_code=\"7\"}[5m])",
+            "legendFormat": "Chat",
+            "refId": "E"
+          }
+        ],
+        "stack": true,
+        "yaxes": [
+          {
+            "format": "short",
+            "label": "Messages/sec",
+            "show": true
+          }
+        ]
+      },
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "id": 9,
+        "title": "CPU Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(container_cpu_usage_seconds_total{container=\"nakama\"}[5m]) * 100",
+            "legendFormat": "Nakama CPU %",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "percent",
+            "label": "CPU Usage",
+            "show": true
+          }
+        ]
+      },
+      {
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "id": 10,
+        "title": "Memory Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "container_memory_usage_bytes{container=\"nakama\"} / 1024 / 1024",
+            "legendFormat": "Nakama Memory",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "decmbytes",
+            "label": "Memory",
+            "show": true
+          }
+        ]
+      },
+      {
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 40},
+        "id": 11,
+        "title": "Match Creation Rate",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "rate(nakama_match_create_total{match_type=\"spatial_ar_match\"}[5m]) * 60",
+            "refId": "A"
+          }
+        ],
+        "format": "short",
+        "postfix": " /min",
+        "valueName": "current"
+      },
+      {
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 40},
+        "id": 12,
+        "title": "Average Match Size",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "avg(nakama_match_presences{match_type=\"spatial_ar_match\"})",
+            "refId": "A"
+          }
+        ],
+        "format": "short",
+        "postfix": " users",
+        "valueName": "current"
+      },
+      {
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 40},
+        "id": 13,
+        "title": "Host Transfers",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "increase(nakama_match_host_transfers_total{match_type=\"spatial_ar_match\"}[1h])",
+            "refId": "A"
+          }
+        ],
+        "format": "short",
+        "postfix": " /hour",
+        "valueName": "current"
+      },
+      {
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 40},
+        "id": 14,
+        "title": "Error Rate",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "rate(nakama_api_errors_total[5m]) * 100",
+            "refId": "A"
+          }
+        ],
+        "format": "percent",
+        "valueName": "current",
+        "thresholds": "1,5",
+        "colors": ["green", "yellow", "red"]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {
+            "text": "Prometheus",
+            "value": "Prometheus"
+          }
+        },
+        {
+          "name": "refresh",
+          "type": "interval",
+          "options": [
+            {"text": "5s", "value": "5s"},
+            {"text": "10s", "value": "10s"},
+            {"text": "30s", "value": "30s"},
+            {"text": "1m", "value": "1m"},
+            {"text": "5m", "value": "5m"}
+          ],
+          "current": {
+            "text": "10s",
+            "value": "10s"
+          }
+        }
+      ]
+    },
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "10s"
+  }
+}

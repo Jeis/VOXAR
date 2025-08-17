@@ -30,11 +30,16 @@ def test_task():
     """Test task to verify Celery is working"""
     return "Celery is working!"
 
-@app.task
-def reconstruction_task(job_id: str):
-    """3D reconstruction task"""
-    # TODO: Implement COLMAP reconstruction
-    return f"Reconstruction job {job_id} completed"
+@app.task(bind=True)
+def reconstruction_task(self, job_id: str, config: dict = None):
+    """3D reconstruction task with full COLMAP pipeline"""
+    from .tasks import reconstruction_task as detailed_reconstruction_task
+    
+    # Delegate to the detailed implementation in tasks.py
+    return detailed_reconstruction_task.apply_async(
+        args=[job_id], 
+        kwargs={'config': config}
+    ).get()
 
 if __name__ == '__main__':
     app.start()

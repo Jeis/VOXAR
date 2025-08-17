@@ -4,12 +4,18 @@ opencv-python==4.8.1.78
 Pillow==10.0.1
 scipy==1.11.3
 
-# 3D reconstruction
+# 3D reconstruction - Production Grade
 pycolmap==0.4.0
+open3d==0.18.0       # For advanced 3D processing
+trimesh==4.0.4       # For mesh processing
+vtk==9.3.0           # For 3D visualization
 
 # Computer vision and ML
 scikit-image==0.21.0
 matplotlib==3.7.2
+exifread==3.0.0      # For EXIF metadata reading
+rawpy==0.18.1        # For RAW image support
+imageio==2.31.5      # Enhanced image I/O
 
 # Cloud and storage
 boto3==1.29.7
@@ -43,6 +49,14 @@ python-dotenv==1.0.0
 pyyaml==6.0.1
 requests==2.31.0
 tqdm==4.66.1
+
+# GPS and geospatial processing
+geopy==2.4.0
+pyproj==3.6.1
+
+# File integrity and security
+hashlib-compat==1.0.1
+cryptography==41.0.7
 
 # Development and testing
 pytest==7.4.2

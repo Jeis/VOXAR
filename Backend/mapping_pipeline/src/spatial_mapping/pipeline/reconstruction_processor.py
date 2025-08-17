@@ -226,16 +226,140 @@ class ReconstructionProcessor:
     
     def _download_image(self, image_meta, work_dir: Path) -> Path:
         """
-        Download image from storage backend
-        This is a placeholder - actual implementation would depend on storage system
+        Download image from storage backend with robust error handling and retry logic
         """
-        # For now, assume images are already local or implement actual download logic
+        from urllib.parse import urlparse
+        import requests
+        from pathlib import Path
+        import hashlib
+        
         local_path = work_dir / "downloads" / image_meta.filename
         local_path.parent.mkdir(exist_ok=True)
         
-        # Placeholder implementation - in reality this would download from S3/GCS/etc
-        # For demo purposes, we'll just return a path
-        return local_path
+        try:
+            # Determine storage backend from image metadata
+            if hasattr(image_meta, 'storage_url') and image_meta.storage_url:
+                # Download from remote URL (S3, GCS, HTTP, etc.)
+                url = image_meta.storage_url
+                parsed_url = urlparse(url)
+                
+                if parsed_url.scheme in ['http', 'https']:
+                    # HTTP/HTTPS download
+                    response = requests.get(url, timeout=30, stream=True)
+                    response.raise_for_status()
+                    
+                    with open(local_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                
+                elif parsed_url.scheme == 's3':
+                    # S3 download using boto3
+                    try:
+                        import boto3
+                        s3_client = boto3.client('s3')
+                        bucket = parsed_url.netloc
+                        key = parsed_url.path.lstrip('/')
+                        s3_client.download_file(bucket, key, str(local_path))
+                    except ImportError:
+                        logger.error("boto3 not installed - cannot download from S3")
+                        raise RuntimeError("S3 support requires boto3")
+                        
+                elif parsed_url.scheme == 'gs':
+                    # Google Cloud Storage download
+                    try:
+                        from google.cloud import storage
+                        client = storage.Client()
+                        bucket_name = parsed_url.netloc
+                        blob_name = parsed_url.path.lstrip('/')
+                        bucket = client.bucket(bucket_name)
+                        blob = bucket.blob(blob_name)
+                        blob.download_to_filename(str(local_path))
+                    except ImportError:
+                        logger.error("google-cloud-storage not installed - cannot download from GCS")
+                        raise RuntimeError("GCS support requires google-cloud-storage")
+                        
+                else:
+                    raise ValueError(f"Unsupported storage scheme: {parsed_url.scheme}")
+                    
+            elif hasattr(image_meta, 'local_path') and image_meta.local_path:
+                # Copy from local filesystem
+                import shutil
+                shutil.copy2(image_meta.local_path, local_path)
+                
+            else:
+                # Try to construct path from filename (backward compatibility)
+                possible_paths = [
+                    Path(f"/app/data/images/{image_meta.filename}"),
+                    Path(f"/tmp/spatial_images/{image_meta.filename}"),
+                    Path(f"./images/{image_meta.filename}")
+                ]
+                
+                found = False
+                for possible_path in possible_paths:
+                    if possible_path.exists():
+                        import shutil
+                        shutil.copy2(possible_path, local_path)
+                        found = True
+                        break
+                
+                if not found:
+                    raise FileNotFoundError(f"Could not locate image: {image_meta.filename}")
+            
+            # Verify file integrity if checksum available
+            if hasattr(image_meta, 'checksum') and image_meta.checksum:
+                actual_checksum = self._calculate_file_checksum(local_path)
+                if actual_checksum != image_meta.checksum:
+                    raise ValueError(f"Checksum mismatch for {image_meta.filename}")
+            
+            # Verify file is a valid image
+            if not self._verify_image_file(local_path):
+                raise ValueError(f"Downloaded file is not a valid image: {image_meta.filename}")
+            
+            logger.debug(f"Successfully downloaded image: {image_meta.filename} ({local_path.stat().st_size} bytes)")
+            return local_path
+            
+        except Exception as e:
+            logger.error(f"Failed to download image {image_meta.filename}: {e}")
+            if local_path.exists():
+                local_path.unlink()  # Clean up partial download
+            raise
+    
+    def _calculate_file_checksum(self, file_path: Path) -> str:
+        """Calculate SHA256 checksum of file"""
+        hash_sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
+    
+    def _verify_image_file(self, file_path: Path) -> bool:
+        """Verify file is a valid image"""
+        try:
+            with open(file_path, 'rb') as f:
+                # Check common image file signatures
+                header = f.read(16)
+                
+                # JPEG
+                if header.startswith(b'\xff\xd8\xff'):
+                    return True
+                # PNG
+                if header.startswith(b'\x89PNG\r\n\x1a\n'):
+                    return True
+                # TIFF
+                if header.startswith(b'II*\x00') or header.startswith(b'MM\x00*'):
+                    return True
+                # BMP
+                if header.startswith(b'BM'):
+                    return True
+                    
+            # Try to open with OpenCV as final check
+            import cv2
+            img = cv2.imread(str(file_path))
+            return img is not None
+            
+        except Exception:
+            return False
     
     def _analyze_image_distribution(self, image_paths: List[Path], job: ReconstructionJob):
         """Analyze spatial and temporal distribution of images"""

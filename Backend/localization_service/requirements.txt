@@ -18,13 +18,26 @@ pyyaml==6.0.1
 matplotlib==3.7.2
 pillow==10.1.0
 
+# Production SLAM Systems (install via Docker)
+# stella-vslam  # Installed in Docker container
+# pycolmap==0.4.0  # For COLMAP integration (installed in Docker)
+
+# For production SLAM support
+requests==2.31.0
+toml==0.10.2
+base64==0.4.1
+imageio==2.31.5
+open3d==0.18.0  # For 3D visualization and processing
+
 # Real-time processing
 websockets==12.0
 asyncio-mqtt==0.16.1
 
 # VIO Integration
-scipy==1.11.4  # Already included above but needed for VIO
+# scipy==1.11.4  # Already included above
 collections-extended==2.0.2  # For advanced data structures
+filterpy==1.4.5  # For Kalman filtering
+numba==0.58.1  # For performance optimization
 
 # Development and debugging
 python-multipart==0.0.6

@@ -1,10 +1,9 @@
-name: spatial-platform-nakama
+name: spatial-ar
 data_dir: "/nakama/data"
 
 logger:
   stdout: true
   level: "INFO"
-  file: "/nakama/data/logs/nakama.log"
 
 session:
   token_expiry_sec: 7200  # 2 hours
@@ -25,12 +24,14 @@ socket:
   ping_period_ms: 15000
   ping_backoff_threshold: 20
 
+api:
+  port: 7350
+  address: "0.0.0.0"
+
 runtime:
-  env:
-    - "spatial_environment"
   http_key: "spatial_http_key_2024"
   read_only_globals: true
-  js_entrypoint: "index.js"
+  lua_entrypoint: "main.lua"
 
 tracker:
   event_queue_size: 8192
@@ -55,6 +56,8 @@ console:
 cluster:
   join: []
   max_message_size_bytes: 4096
+  gossip_bindaddr: "0.0.0.0"
+  gossip_bindport: 7352
 
 database:
   address:

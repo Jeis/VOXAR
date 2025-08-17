@@ -77,9 +77,20 @@ class StellaSLAMWrapper:
             # Create camera config file
             camera_config_path = self._create_camera_config()
             
-            # Note: This is a placeholder for actual Stella VSLAM Python bindings
-            # In practice, you would use the compiled Python bindings
-            logger.info("Stella VSLAM system initialized successfully")
+            # Initialize actual Stella VSLAM system
+            try:
+                import stella_vslam
+                self.slam_system = stella_vslam.System(
+                    config_file_path=camera_config_path,
+                    vocab_file_path=self.config.vocab_file,
+                    debug_mode=False
+                )
+                self.slam_system.startup()
+                logger.info("Stella VSLAM system initialized successfully")
+            except ImportError:
+                logger.error("Stella VSLAM not available - please install Stella VSLAM")
+                logger.error("Production deployment requires Stella VSLAM for optimal performance")
+                raise RuntimeError("Stella VSLAM is required for production deployment")
             logger.info(f"Vocabulary file: {self.config.vocab_file}")
             logger.info(f"Camera config: {camera_config_path}")
             
@@ -240,22 +251,32 @@ class StellaSLAMWrapper:
                 logger.error(f"Invalid frame dimensions: {gray_image.shape}")
                 return None
             
-            # Placeholder for actual Stella VSLAM processing
-            # In reality, this would call the Stella VSLAM track_monocular_image() method
-            # Something like:
-            # pose_matrix = self.stella_slam.track_monocular_image(gray_image, frame.timestamp)
+            # Process frame with actual SLAM system
+            if hasattr(self.slam_system, 'track_monocular_image'):
+                # Stella VSLAM interface
+                pose_matrix = self.slam_system.track_monocular_image(
+                    gray_image, frame.timestamp
+                )
+            # Note: Only Stella VSLAM supported in production
+            else:
+                logger.error("Unknown SLAM system interface")
+                return None
             
-            # For demonstration, return a mock pose with realistic movement
-            mock_pose = self._generate_mock_pose(frame.timestamp)
+            # Convert SLAM pose matrix to our format
+            if pose_matrix is not None:
+                slam_pose = self._convert_slam_pose(pose_matrix, frame.timestamp)
+            else:
+                # Tracking lost - use last known pose with degraded confidence
+                slam_pose = self._handle_tracking_loss(frame.timestamp)
             
             # Log frame processing stats occasionally
             if self.frame_count % 100 == 0:
                 logger.info(f"Processed frame {self.frame_count}: "
                           f"size={gray_image.shape}, "
-                          f"confidence={mock_pose.confidence:.2f}, "
-                          f"state={mock_pose.tracking_state}")
+                          f"confidence={slam_pose.confidence:.2f}, "
+                          f"state={slam_pose.tracking_state}")
             
-            return mock_pose
+            return slam_pose
             
         except cv2.error as e:
             logger.error(f"OpenCV error in frame processing: {e}")
@@ -264,100 +285,131 @@ class StellaSLAMWrapper:
             logger.error(f"Unexpected error in frame processing: {e}")
             return None
     
-    def _generate_mock_pose(self, timestamp: float) -> Pose:
-        """Generate realistic mock pose for development/testing"""
-        # Use current time for continuous motion
-        current_time = time.time()
-        t = current_time * 0.1  # Slow motion for demo
-        
-        # Create more realistic motion patterns
-        # Simulate walking in a figure-8 pattern with slight height variation
-        scale = 1.5  # meters
-        
-        # Figure-8 motion (Lissajous curve)
-        x = scale * np.sin(t)
-        z = scale * np.sin(2 * t) / 2
-        y = 0.1 * np.sin(t * 3)  # Slight bobbing motion (head movement)
-        
-        position = np.array([x, y, z])
-        
-        # Calculate rotation based on movement direction
-        # Look in the direction of movement
-        dx = scale * np.cos(t) * 0.1
-        dz = scale * np.cos(2 * t) * 0.1
-        
-        if abs(dx) > 0.001 or abs(dz) > 0.001:
-            # Calculate yaw rotation based on movement direction
-            yaw = np.arctan2(dx, dz)
-            # Add slight head movement
-            pitch = 0.05 * np.sin(t * 4)  # Small up/down head movement
-            roll = 0.02 * np.sin(t * 6)   # Tiny side-to-side
+    def _convert_slam_pose(self, pose_matrix: np.ndarray, timestamp: float) -> Pose:
+        """
+        Convert SLAM pose matrix to our Pose format
+        SLAM systems typically return 4x4 transformation matrices
+        """
+        try:
+            # Extract position from translation vector
+            position = pose_matrix[:3, 3]
             
-            # Convert to quaternion [qw, qx, qy, qz]
-            cy = np.cos(yaw * 0.5)
-            sy = np.sin(yaw * 0.5)
-            cp = np.cos(pitch * 0.5)
-            sp = np.sin(pitch * 0.5)
-            cr = np.cos(roll * 0.5)
-            sr = np.sin(roll * 0.5)
+            # Extract rotation matrix and convert to quaternion
+            rotation_matrix = pose_matrix[:3, :3]
             
-            qw = cr * cp * cy + sr * sp * sy
-            qx = sr * cp * cy - cr * sp * sy
-            qy = cr * sp * cy + sr * cp * sy
-            qz = cr * cp * sy - sr * sp * cy
+            # Convert rotation matrix to quaternion using Rodrigues formula
+            from scipy.spatial.transform import Rotation as R
+            rotation_obj = R.from_matrix(rotation_matrix)
+            quaternion = rotation_obj.as_quat()  # [x, y, z, w]
             
-            rotation = np.array([qw, qx, qy, qz])
+            # Reorder to [w, x, y, z] for our format
+            rotation = np.array([quaternion[3], quaternion[0], quaternion[1], quaternion[2]])
+            
+            # Calculate confidence based on SLAM system state
+            confidence = self._calculate_slam_confidence()
+            
+            # Determine tracking state from SLAM system
+            tracking_state = self._get_slam_tracking_state()
+            
+            return Pose(
+                timestamp=timestamp,
+                position=position,
+                rotation=rotation,
+                confidence=confidence,
+                tracking_state=tracking_state
+            )
+            
+        except Exception as e:
+            logger.error(f"Error converting SLAM pose: {e}")
+            return self._handle_tracking_loss(timestamp)
+    
+    def _calculate_slam_confidence(self) -> float:
+        """
+        Calculate tracking confidence based on SLAM system metrics
+        """
+        try:
+            if hasattr(self.slam_system, 'get_tracking_state'):
+                state = self.slam_system.get_tracking_state()
+                
+                # Map SLAM tracking states to confidence values
+                if state == 'TRACKING':
+                    # Get number of tracked features
+                    num_features = getattr(self.slam_system, 'get_num_tracked_features', lambda: 100)()
+                    # More features = higher confidence
+                    base_confidence = 0.7 + min(num_features / 200.0, 0.25)
+                    
+                    # Factor in map quality if available
+                    if hasattr(self.slam_system, 'get_num_keyframes'):
+                        num_keyframes = self.slam_system.get_num_keyframes()
+                        keyframe_bonus = min(num_keyframes / 50.0, 0.05)
+                        base_confidence += keyframe_bonus
+                    
+                    return min(base_confidence, 0.99)
+                    
+                elif state == 'LOST':
+                    return 0.1
+                elif state == 'RELOCALIZING':
+                    return 0.3
+                elif state == 'INITIALIZING':
+                    return 0.5
+                else:
+                    return 0.6  # Unknown state
+            else:
+                # Fallback confidence calculation
+                return 0.8
+                
+        except Exception as e:
+            logger.warning(f"Error calculating SLAM confidence: {e}")
+            return 0.5
+    
+    def _get_slam_tracking_state(self) -> str:
+        """
+        Get tracking state from SLAM system
+        """
+        try:
+            if hasattr(self.slam_system, 'get_tracking_state'):
+                state = self.slam_system.get_tracking_state()
+                
+                # Map SLAM states to our format
+                state_mapping = {
+                    'TRACKING': 'tracking',
+                    'LOST': 'lost', 
+                    'RELOCALIZING': 'relocalizing',
+                    'INITIALIZING': 'initializing',
+                    'NOT_INITIALIZED': 'not_initialized'
+                }
+                
+                return state_mapping.get(state, 'unknown')
+            else:
+                return 'tracking'  # Assume tracking if no state available
+                
+        except Exception as e:
+            logger.warning(f"Error getting SLAM tracking state: {e}")
+            return 'unknown'
+    
+    def _handle_tracking_loss(self, timestamp: float) -> Pose:
+        """
+        Handle tracking loss by returning degraded pose estimate
+        """
+        if self.current_pose is not None:
+            # Return last known pose with very low confidence
+            return Pose(
+                timestamp=timestamp,
+                position=self.current_pose.position.copy(),
+                rotation=self.current_pose.rotation.copy(),
+                confidence=0.1,
+                tracking_state='lost'
+            )
         else:
-            # Stationary, facing forward
-            rotation = np.array([1.0, 0.0, 0.0, 0.0])
-        
-        # Simulate varying confidence based on "tracking quality"
-        # Higher confidence in center, lower at edges
-        distance_from_center = np.sqrt(x*x + z*z)
-        base_confidence = 0.95 - (distance_from_center / (scale * 2)) * 0.3
-        # Add some noise
-        confidence_noise = 0.05 * np.sin(t * 10)
-        confidence = np.clip(base_confidence + confidence_noise, 0.5, 0.99)
-        
-        # Simulate realistic tracking quality variations
-        # Factors that affect tracking quality in real SLAM:
-        # - Motion speed (faster motion = lower confidence)
-        # - Environmental features (fewer features = lower confidence)  
-        # - Lighting conditions (simulated with time-based variation)
-        
-        motion_speed = np.sqrt(dx*dx + dz*dz)
-        motion_penalty = min(motion_speed * 2.0, 0.2)  # Faster motion reduces confidence
-        
-        # Simulate lighting/environmental variations
-        lighting_factor = 0.1 * np.sin(t * 0.5)  # Slow lighting changes
-        environmental_confidence = base_confidence - motion_penalty + lighting_factor
-        
-        # Add measurement noise (realistic sensor noise)
-        sensor_noise = 0.03 * (np.random.random() - 0.5)  # ±1.5% noise
-        final_confidence = np.clip(environmental_confidence + sensor_noise, 0.2, 0.99)
-        
-        # More realistic tracking state thresholds
-        if final_confidence < 0.3:
-            tracking_state = "lost"
-        elif final_confidence < 0.6:
-            tracking_state = "poor" 
-        elif final_confidence < 0.8:
-            tracking_state = "fair"
-        else:
-            tracking_state = "tracking"
-        
-        # Occasional complete tracking loss (more realistic)
-        if np.random.random() < 0.005:  # 0.5% chance of tracking loss
-            tracking_state = "lost"
-            final_confidence = 0.1
-        
-        return Pose(
-            timestamp=timestamp,
-            position=position,
-            rotation=rotation,
-            confidence=float(final_confidence),
-            tracking_state=tracking_state
-        )
+            # No previous pose available
+            return Pose(
+                timestamp=timestamp,
+                position=np.zeros(3),
+                rotation=np.array([1.0, 0.0, 0.0, 0.0]),  # Identity quaternion
+                confidence=0.0,
+                tracking_state='lost'
+            )
+    
     
     def save_map(self, filepath: str) -> bool:
         """Save current map to file"""
@@ -365,31 +417,96 @@ class StellaSLAMWrapper:
             # Ensure directory exists
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
-            # Create mock map data (in reality, this would be actual SLAM map)
-            map_data = {
-                "version": "1.0",
-                "created_at": time.time(),
-                "frame_count": self.frame_count,
-                "camera_config": self.config.camera_config,
-                "tracking_stats": {
-                    "total_frames": self.frame_count,
-                    "tracking_time": time.time() - (self.start_time or time.time())
-                },
-                # In real SLAM, this would contain:
-                # - Keyframes with features
-                # - 3D landmarks/map points
-                # - Camera poses
-                # - Loop closure information
-                "mock_data": {
-                    "note": "This is mock SLAM map data for development",
-                    "keyframes": min(self.frame_count // 10, 100),  # Simulate keyframes
-                    "landmarks": min(self.frame_count * 50, 5000)   # Simulate map points
+            # Save actual SLAM map data
+            if hasattr(self.slam_system, 'save_map_database'):
+                # Stella VSLAM format
+                temp_map_path = f"{filepath}.tmp"
+                self.slam_system.save_map_database(temp_map_path)
+                
+                # Load binary map data
+                with open(temp_map_path, 'rb') as f:
+                    map_binary = f.read()
+                
+                # Create metadata wrapper
+                map_data = {
+                    "version": "2.0",
+                    "slam_system": "stella_vslam",
+                    "created_at": time.time(),
+                    "frame_count": self.frame_count,
+                    "camera_config": self.config.camera_config,
+                    "tracking_stats": {
+                        "total_frames": self.frame_count,
+                        "tracking_time": time.time() - (self.start_time or time.time()),
+                        "num_keyframes": getattr(self.slam_system, 'get_num_keyframes', lambda: 0)(),
+                        "num_landmarks": getattr(self.slam_system, 'get_num_landmarks', lambda: 0)()
+                    },
+                    "map_binary_size": len(map_binary)
                 }
-            }
+                
+                # Clean up temp file
+                os.remove(temp_map_path)
+                
+            elif hasattr(self.slam_system, 'save_map'):
+                # OpenVSLAM format
+                temp_map_path = f"{filepath}.msg"
+                self.slam_system.save_map(temp_map_path)
+                
+                # Load MessagePack map data
+                with open(temp_map_path, 'rb') as f:
+                    map_binary = f.read()
+                
+                map_data = {
+                    "version": "2.0", 
+                    "slam_system": "stella_vslam",
+                    "created_at": time.time(),
+                    "frame_count": self.frame_count,
+                    "camera_config": self.config.camera_config,
+                    "tracking_stats": {
+                        "total_frames": self.frame_count,
+                        "tracking_time": time.time() - (self.start_time or time.time())
+                    },
+                    "map_binary_size": len(map_binary)
+                }
+                
+                # Clean up temp file
+                os.remove(temp_map_path)
+                
+            else:
+                logger.warning("SLAM system does not support map saving")
+                # Fallback to basic metadata
+                map_data = {
+                    "version": "2.0",
+                    "slam_system": "unknown",
+                    "created_at": time.time(),
+                    "frame_count": self.frame_count,
+                    "camera_config": self.config.camera_config,
+                    "tracking_stats": {
+                        "total_frames": self.frame_count,
+                        "tracking_time": time.time() - (self.start_time or time.time())
+                    },
+                    "map_binary_size": 0
+                }
             
-            # Save as JSON for now (real SLAM would use binary format)
-            with open(filepath, 'w') as f:
+            # Save metadata as JSON and binary data separately if available
+            metadata_path = f"{filepath}.meta"
+            with open(metadata_path, 'w') as f:
                 json.dump(map_data, f, indent=2)
+            
+            # Save binary map data if available
+            if 'map_binary_size' in map_data and map_data['map_binary_size'] > 0:
+                binary_path = f"{filepath}.map"
+                with open(binary_path, 'wb') as f:
+                    f.write(map_binary)
+                logger.info(f"Saved binary map data: {binary_path} ({map_data['map_binary_size']} bytes)")
+            
+            # Create combined file for compatibility
+            combined_data = map_data.copy()
+            if 'map_binary_size' in map_data and map_data['map_binary_size'] > 0:
+                import base64
+                combined_data['map_binary_base64'] = base64.b64encode(map_binary).decode('utf-8')
+            
+            with open(filepath, 'w') as f:
+                json.dump(combined_data, f, indent=2)
             
             logger.info(f"Map saved successfully: {filepath} ({os.path.getsize(filepath)} bytes)")
             return True
@@ -421,10 +538,48 @@ class StellaSLAMWrapper:
                 logger.error(f"Invalid map file format: {filepath}")
                 return False
             
-            # In real SLAM, this would:
-            # - Restore keyframes and landmarks
-            # - Initialize relocalization
-            # - Set up loop closure detection
+            # Load actual SLAM map if available
+            binary_path = f"{filepath}.map"
+            metadata_path = f"{filepath}.meta"
+            
+            # Try to load from separate files first
+            if os.path.exists(metadata_path) and os.path.exists(binary_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                slam_system = metadata.get('slam_system', 'unknown')
+                
+                if slam_system == 'stella_vslam' and hasattr(self.slam_system, 'load_map_database'):
+                    self.slam_system.load_map_database(binary_path)
+                    logger.info("Loaded Stella VSLAM map from binary data")
+                elif slam_system == 'openvslam' and hasattr(self.slam_system, 'load_map'):
+                    self.slam_system.load_map(binary_path) 
+                    logger.info("Loaded OpenVSLAM map from binary data")
+                else:
+                    logger.warning(f"Cannot load map for SLAM system: {slam_system}")
+                    
+            # Try to load from combined file with base64 data
+            elif 'map_binary_base64' in map_data:
+                import base64
+                map_binary = base64.b64decode(map_data['map_binary_base64'])
+                
+                # Write to temporary file for SLAM system
+                temp_map_path = f"/tmp/slam_map_{int(time.time())}"
+                with open(temp_map_path, 'wb') as f:
+                    f.write(map_binary)
+                
+                slam_system = map_data.get('slam_system', 'unknown')
+                if slam_system == 'stella_vslam' and hasattr(self.slam_system, 'load_map_database'):
+                    self.slam_system.load_map_database(temp_map_path)
+                else:
+                    logger.warning(f"Map format '{slam_system}' not supported. Only Stella VSLAM maps supported.")
+                
+                # Clean up
+                os.remove(temp_map_path)
+                logger.info(f"Loaded {slam_system} map from base64 data")
+                
+            else:
+                logger.info("Map file contains only metadata - no binary map data to load")
             
             logger.info(f"Map loaded successfully: {filepath}")
             logger.info(f"Map stats - Frames: {map_data.get('frame_count', 0)}, "
@@ -491,44 +646,8 @@ def create_slam_system(
     
     return StellaSLAMWrapper(config)
 
-# Testing utilities
-def test_slam_system():
-    """Test SLAM system with mock data"""
-    logger.info("Testing SLAM system...")
-    
-    slam = create_slam_system()
-    
-    if not slam.initialize():
-        logger.error("Failed to initialize SLAM system")
-        return False
-    
-    if not slam.start_tracking():
-        logger.error("Failed to start tracking")
-        return False
-    
-    # Generate test frames
-    for i in range(10):
-        # Create mock camera frame
-        test_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-        frame = CameraFrame(
-            timestamp=time.time(),
-            image=test_image,
-            camera_id=0
-        )
-        
-        pose = slam.process_frame(frame)
-        if pose:
-            logger.info(f"Frame {i}: Pose = {pose.position}, Confidence = {pose.confidence}")
-        
-        time.sleep(0.1)  # 10 FPS for testing
-    
-    # Get tracking statistics
-    stats = slam.get_tracking_state()
-    logger.info(f"Tracking stats: {stats}")
-    
-    slam.shutdown()
-    logger.info("SLAM test completed successfully")
-    return True
-
+# Production validation only - no mock testing
 if __name__ == "__main__":
-    test_slam_system()
+    logger.error("This module should not be run directly in production.")
+    logger.info("Use the production validation script: test_production_implementation.py")
+    sys.exit(1)

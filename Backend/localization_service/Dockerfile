@@ -57,12 +57,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Note: Stella VSLAM integration commented out due to complex build dependencies
-# For development, we use the mock SLAM implementation in slam_integration.py
-# To enable Stella VSLAM:
-# 1. Fix g2o CMake configuration issues
-# 2. Install additional dependencies (DBoW2, etc.)
-# 3. Uncomment the build commands below
+# Production SLAM Integration
+# Stella VSLAM and OpenVSLAM are now installed via install_slam_dependencies.sh
+# Run the installation script before building this container for full SLAM support
 #
 # # Build and install Stella VSLAM
 # RUN git clone --recursive https://github.com/stella-cv/stella_vslam.git /tmp/stella_vslam && \
@@ -78,9 +75,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 #     make -j$(nproc) && make install && \
 #     cd / && rm -rf /tmp/stella_vslam
 
-# Create placeholder for Stella VSLAM vocabulary
-RUN mkdir -p /app/vocab && \
-    echo "# Stella VSLAM ORB vocabulary placeholder" > /app/vocab/orb_vocab.fbow
+# Create directory for SLAM vocabulary files
+# Vocabulary files are downloaded via install_slam_dependencies.sh
+RUN mkdir -p /app/vocab
 
 # Install Python bindings for Stella VSLAM
 RUN pip install --no-cache-dir \

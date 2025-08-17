@@ -36,10 +36,36 @@ namespace SpatialPlatform.Core.Examples
         // Performance tracking
         private int framesReceived = 0;
         private float startTime;
+        private float lastPoseUpdateTime = 0f;
+        private int consecutiveFailures = 0;
+        
+        // Camera capture
+        private Camera arCamera;
+        private RenderTexture renderTexture;
+        private Texture2D readbackTexture;
 
         private void Start()
         {
             startTime = Time.time;
+            
+            // Get AR camera reference
+            arCamera = Camera.main;
+            if (arCamera == null)
+            {
+                arCamera = FindObjectOfType<Camera>();
+            }
+            
+            if (arCamera != null)
+            {
+                // Setup render texture for frame capture
+                renderTexture = new RenderTexture(640, 480, 0, RenderTextureFormat.RGB24);
+                readbackTexture = new Texture2D(640, 480, TextureFormat.RGB24, false);
+            }
+            else
+            {
+                Debug.LogError("[SLAMDemo] No camera found for frame capture");
+            }
+            
             InitializeDemo();
         }
 
@@ -127,17 +153,108 @@ namespace SpatialPlatform.Core.Examples
 
             while (isDemoRunning)
             {
-                // Send a test frame (mock camera data)
+                // Capture and send real camera frame data
                 if (hybridManager.IsTrackingActive)
                 {
-                    // In a real implementation, this would capture actual camera frames
-                    // For demo purposes, we rely on the mock SLAM in the backend
+                    // Capture current camera frame
+                    if (TryCaptureCurrentFrame(out byte[] frameData, out int width, out int height))
+                    {
+                        // Send frame to SLAM system for processing
+                        var result = hybridManager.ProcessCameraFrame(frameData, width, height);
+                        
+                        if (result == SpatialPlatform.Core.SLAM.SLAMManager.SLAMResult.Success)
+                        {
+                            lastPoseUpdateTime = Time.time;
+                            consecutiveFailures = 0;
+                        }
+                        else if (result == SpatialPlatform.Core.SLAM.SLAMManager.SLAMResult.TrackingLost)
+                        {
+                            consecutiveFailures++;
+                            if (consecutiveFailures > 10)
+                            {
+                                Debug.LogWarning("SLAM tracking lost for extended period - attempting relocalization");
+                                hybridManager.RequestRelocalization();
+                                consecutiveFailures = 0;
+                            }
+                        }
+                    }
+                    
                     yield return new WaitForSeconds(testInterval);
                 }
                 else
                 {
                     yield return new WaitForSeconds(0.1f);
                 }
+            }
+        }
+        
+        /// <summary>
+        /// Capture current camera frame for SLAM processing
+        /// </summary>
+        private bool TryCaptureCurrentFrame(out byte[] frameData, out int width, out int height)
+        {
+            frameData = null;
+            width = 0;
+            height = 0;
+            
+            if (arCamera == null || renderTexture == null || readbackTexture == null)
+            {
+                return false;
+            }
+            
+            try
+            {
+                // Temporarily set camera target texture
+                RenderTexture previousTarget = arCamera.targetTexture;
+                arCamera.targetTexture = renderTexture;
+                
+                // Render camera to texture
+                arCamera.Render();
+                
+                // Read pixels from render texture
+                RenderTexture.active = renderTexture;
+                readbackTexture.ReadPixels(new Rect(0, 0, renderTexture.width, renderTexture.height), 0, 0);
+                readbackTexture.Apply();
+                
+                // Restore previous camera target
+                arCamera.targetTexture = previousTarget;
+                RenderTexture.active = null;
+                
+                // Convert to grayscale bytes for SLAM
+                Color32[] pixels = readbackTexture.GetPixels32();
+                frameData = new byte[pixels.Length];
+                
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    // Convert to grayscale using standard luminance formula
+                    Color32 pixel = pixels[i];
+                    frameData[i] = (byte)(0.299f * pixel.r + 0.587f * pixel.g + 0.114f * pixel.b);
+                }
+                
+                width = renderTexture.width;
+                height = renderTexture.height;
+                
+                return true;
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError($"[SLAMDemo] Failed to capture camera frame: {e.Message}");
+                return false;
+            }
+        }
+        
+        private void OnDestroy()
+        {
+            // Cleanup render textures
+            if (renderTexture != null)
+            {
+                renderTexture.Release();
+                DestroyImmediate(renderTexture);
+            }
+            
+            if (readbackTexture != null)
+            {
+                DestroyImmediate(readbackTexture);
             }
         }
 

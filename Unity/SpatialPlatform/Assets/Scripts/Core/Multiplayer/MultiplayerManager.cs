@@ -32,7 +32,9 @@ namespace SpatialPlatform.Multiplayer
         
         [Header("Authentication")]
         [SerializeField] private AuthenticationManager authManager;
-        [SerializeField] private bool requireAuthentication = true;
+        [SerializeField] private bool requireAuthentication = false;
+        [SerializeField] private bool allowAnonymousSessions = true;
+        [SerializeField] private string anonymousDisplayName = "";
         
         [Header("Performance")]
         [SerializeField] private float poseUpdateRate = 60f; // Hz
@@ -48,6 +50,12 @@ namespace SpatialPlatform.Multiplayer
         private bool isConnected = false;
         private bool isConnecting = false;
         private int reconnectAttempts = 0;
+        
+        // Anonymous session support
+        private bool isAnonymousSession = false;
+        private string anonymousSessionId = "";
+        private string anonymousShareCode = "";
+        private string anonymousUserId = "";
         private float lastPingTime = 0f;
         private float lastPoseUpdateTime = 0f;
         
@@ -78,6 +86,10 @@ namespace SpatialPlatform.Multiplayer
         public event Action<string, string> OnChatMessage;
         public event Action<string> OnError;
         
+        // Anonymous session events
+        public event Action<AnonymousSessionResponse> OnAnonymousSessionCreated;
+        public event Action<AnonymousJoinResponse> OnAnonymousSessionJoined;
+        
         // Properties
         public bool IsConnected => isConnected;
         public bool IsHost => isHost;
@@ -86,6 +98,11 @@ namespace SpatialPlatform.Multiplayer
         public Dictionary<string, PlayerData> RemotePlayers => remotePlayers;
         public Dictionary<string, SpatialAnchorData> SharedAnchors => sharedAnchors;
         public NetworkStats NetworkStats => GetNetworkStats();
+        
+        // Anonymous session properties
+        public bool IsAnonymousSession => isAnonymousSession;
+        public string AnonymousShareCode => anonymousShareCode;
+        public string AnonymousUserId => anonymousUserId;
         
         private void Awake()
         {
@@ -166,7 +183,7 @@ namespace SpatialPlatform.Multiplayer
                 
                 using (UnityWebRequest request = authManager.CreateAuthenticatedRequest(url, "POST", requestData))
                 {
-                    yield return request.SendWebRequest();
+                    await request.SendWebRequest();
                     
                     if (request.result == UnityWebRequest.Result.Success)
                     {
@@ -193,6 +210,105 @@ namespace SpatialPlatform.Multiplayer
             }
         }
         
+        public async void CreateAnonymousSession()
+        {
+            try
+            {
+                string url = $"http{(useSSL ? "s" : "")}://{serverHost}:{serverPort}/api/v1/session/anonymous/create";
+                
+                var requestData = new
+                {
+                    display_name = string.IsNullOrEmpty(anonymousDisplayName) ? $"Player_{UnityEngine.Random.Range(1000, 9999)}" : anonymousDisplayName,
+                    colocalization_method = colocalizationMethod,
+                    max_players = maxPlayersPerSession
+                };
+                
+                string jsonData = JsonConvert.SerializeObject(requestData);
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonData);
+                
+                using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+                {
+                    request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Content-Type", "application/json");
+                    
+                    await request.SendWebRequest();
+                    
+                    if (request.result == UnityWebRequest.Result.Success)
+                    {
+                        var response = JsonConvert.DeserializeObject<AnonymousSessionResponse>(request.downloadHandler.text);
+                        
+                        isAnonymousSession = true;
+                        anonymousSessionId = response.session_id;
+                        anonymousShareCode = response.share_code;
+                        anonymousUserId = response.creator.id;
+                        
+                        Debug.Log($"Anonymous session created with code: {anonymousShareCode}");
+                        OnAnonymousSessionCreated?.Invoke(response);
+                        
+                        await ConnectToSession(response.session_id);
+                    }
+                    else
+                    {
+                        OnError?.Invoke($"Network error creating anonymous session: {request.error}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                OnError?.Invoke($"Error creating anonymous session: {e.Message}");
+            }
+        }
+        
+        public async void JoinAnonymousSession(string shareCode)
+        {
+            try
+            {
+                string url = $"http{(useSSL ? "s" : "")}://{serverHost}:{serverPort}/api/v1/session/anonymous/join";
+                
+                var requestData = new
+                {
+                    code = shareCode.ToUpper(),
+                    display_name = string.IsNullOrEmpty(anonymousDisplayName) ? $"Player_{UnityEngine.Random.Range(1000, 9999)}" : anonymousDisplayName
+                };
+                
+                string jsonData = JsonConvert.SerializeObject(requestData);
+                byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonData);
+                
+                using (UnityWebRequest request = new UnityWebRequest(url, "POST"))
+                {
+                    request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                    request.downloadHandler = new DownloadHandlerBuffer();
+                    request.SetRequestHeader("Content-Type", "application/json");
+                    
+                    await request.SendWebRequest();
+                    
+                    if (request.result == UnityWebRequest.Result.Success)
+                    {
+                        var response = JsonConvert.DeserializeObject<AnonymousJoinResponse>(request.downloadHandler.text);
+                        
+                        isAnonymousSession = true;
+                        anonymousSessionId = response.session_id;
+                        anonymousShareCode = response.share_code;
+                        anonymousUserId = response.user.id;
+                        
+                        Debug.Log($"Joined anonymous session with code: {anonymousShareCode}");
+                        OnAnonymousSessionJoined?.Invoke(response);
+                        
+                        await ConnectToSession(response.session_id);
+                    }
+                    else
+                    {
+                        OnError?.Invoke($"Failed to join session with code {shareCode}: {request.error}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                OnError?.Invoke($"Error joining anonymous session: {e.Message}");
+            }
+        }
+
         public async void JoinSession(string sessionId)
         {
             await ConnectToSession(sessionId);
@@ -302,8 +418,8 @@ namespace SpatialPlatform.Multiplayer
         {
             if (isConnecting || isConnected) return;
             
-            // Check authentication
-            if (requireAuthentication && (authManager == null || !authManager.IsAuthenticated))
+            // Check authentication for non-anonymous sessions
+            if (requireAuthentication && !isAnonymousSession && (authManager == null || !authManager.IsAuthenticated))
             {
                 OnError?.Invoke("Authentication required to connect to session");
                 return;
@@ -315,9 +431,20 @@ namespace SpatialPlatform.Multiplayer
             
             try
             {
-                // Use token-based WebSocket URL
-                string token = authManager?.AccessToken ?? "";
-                string wsUrl = $"ws{(useSSL ? "s" : "")}://{serverHost}:{serverPort}/ws/{sessionId}?token={token}";
+                // Build WebSocket URL with optional token
+                string wsUrl;
+                if (isAnonymousSession)
+                {
+                    // Anonymous sessions don't require authentication token
+                    wsUrl = $"ws{(useSSL ? "s" : "")}://{serverHost}:{serverPort}/ws/{sessionId}";
+                }
+                else
+                {
+                    // Use token-based WebSocket URL for authenticated sessions
+                    string token = authManager?.AccessToken ?? "";
+                    wsUrl = $"ws{(useSSL ? "s" : "")}://{serverHost}:{serverPort}/ws/{sessionId}?token={token}";
+                }
+                
                 websocket = new WebSocket(wsUrl);
                 
                 websocket.OnOpen += OnWebSocketOpen;
@@ -710,6 +837,12 @@ namespace SpatialPlatform.Multiplayer
             sharedAnchors.Clear();
             coordinateSystem = null;
             reconnectAttempts = 0;
+            
+            // Clear anonymous session state
+            isAnonymousSession = false;
+            anonymousSessionId = "";
+            anonymousShareCode = "";
+            anonymousUserId = "";
         }
         
         private NetworkStats GetNetworkStats()
@@ -805,5 +938,48 @@ namespace SpatialPlatform.Multiplayer
         public string error;
         public int max_players;
         public string colocalization_method;
+    }
+    
+    [Serializable]
+    public class AnonymousSessionResponse
+    {
+        public string session_id;
+        public string share_code;
+        public AnonymousCreator creator;
+        public int expires_in;
+        public int max_players;
+        public string created_at;
+    }
+    
+    [Serializable]
+    public class AnonymousCreator
+    {
+        public string id;
+        public string display_name;
+        public bool is_anonymous;
+    }
+    
+    [Serializable]
+    public class AnonymousJoinResponse
+    {
+        public string session_id;
+        public AnonymousUser user;
+        public string share_code;
+        public AnonymousSessionInfo session_info;
+    }
+    
+    [Serializable]
+    public class AnonymousUser
+    {
+        public string id;
+        public string display_name;
+        public bool is_anonymous;
+    }
+    
+    [Serializable]
+    public class AnonymousSessionInfo
+    {
+        public int max_players;
+        public int expires_in;
     }
 }
