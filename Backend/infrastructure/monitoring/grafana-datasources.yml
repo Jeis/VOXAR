@@ -1,9 +1,203 @@
 apiVersion: 1
 
+# VOXAR Platform - Comprehensive Grafana Datasource Configuration
+# Production-ready observability stack for AR/VR spatial computing platform
+# Supports distributed tracing, metrics correlation, and log aggregation
+
 datasources:
+  # Primary metrics source - Prometheus
   - name: Prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
-    editable: true
+    editable: false  # Production security: prevent unauthorized changes
+    uid: "prometheus"
+    jsonData:
+      timeout: 60  # Explicit timeout for large queries
+      timeInterval: "15s"  # Balanced for performance and granularity
+      queryTimeout: "120s"  # Extended for complex queries
+      httpMethod: "POST"
+      customQueryParameters: ""
+      manageAlerts: false  # Disabled until AlertManager is deployed
+      # TODO: Enable when AlertManager is added
+      # alertmanagerUid: "alertmanager"
+      # manageAlerts: true
+      exemplarTraceIdDestinations:
+        - name: "TraceID"
+          datasourceUid: "jaeger"
+          urlDisplayLabel: "View Trace"
+      # Performance settings
+      keepCookies: []
+      sigV4Auth: false
+
+  # Distributed tracing source - Jaeger  
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false  # Production security: prevent unauthorized changes
+    uid: "jaeger"
+    jsonData:
+      timeout: 30  # Explicit timeout for trace queries
+      # Comprehensive traces to logs correlation
+      tracesToLogs:
+        datasourceUid: "loki"
+        tags: 
+          - "service.name"
+          - "service.namespace"
+          - "service.version"
+          - "deployment.environment"
+          - "hostname"
+          - "container.id"
+        mappedTags:
+          - key: "service.name"
+            value: "service"
+          - key: "service.namespace"
+            value: "namespace"
+        mapTagNamesEnabled: true
+        spanStartTimeShift: "-2h"  # Extended time window for correlation
+        spanEndTimeShift: "2h"
+        filterByTraceID: true
+        filterBySpanID: false
+        lokiSearch: true
+      # Production metrics correlation with SLI focus
+      tracesToMetrics:
+        datasourceUid: "prometheus"
+        tags:
+          - key: "service.name"
+            value: "service"
+          - key: "service.namespace"
+            value: "namespace"
+          - key: "job"
+          - key: "instance"
+        queries:
+          # Core SLI metrics for production monitoring
+          - name: "Request Rate (RPS)"
+            query: 'sum(rate(http_requests_total{service="$service",namespace="$namespace"}[5m]))'
+          - name: "Error Rate (%)"
+            query: 'sum(rate(http_requests_total{service="$service",namespace="$namespace",status=~"5.."}[5m]))/sum(rate(http_requests_total{service="$service",namespace="$namespace"}[5m]))*100'
+          - name: "P50 Latency"
+            query: 'histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{service="$service",namespace="$namespace"}[5m])) by (le))'
+          - name: "P95 Latency"
+            query: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="$service",namespace="$namespace"}[5m])) by (le))'
+          - name: "P99 Latency"
+            query: 'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="$service",namespace="$namespace"}[5m])) by (le))'
+          # Legacy query for backward compatibility
+          - name: "Sample query"
+            query: "sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m]))"
+      # Enhanced service dependency visualization
+      nodeGraph:
+        enabled: true
+      # Detailed span analysis
+      spanBar:
+        type: "Tag"
+        tag: "http.status_code"
+      # Performance optimization
+      maxConcurrentQueries: 10
+      maxQueryLength: 10000
+
+  # Log aggregation source - Loki
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false  # Production security: prevent unauthorized changes
+    uid: "loki"
+    jsonData:
+      timeout: 60  # Explicit timeout for log queries
+      # Comprehensive logs to traces correlation
+      derivedFields:
+        - datasourceUid: "jaeger"
+          matcherRegex: "(?i)trace[_\\-]?id[\"=:\\s]*([a-fA-F0-9]{16,32})"
+          name: "TraceID"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View Trace"
+          internal: true
+        - datasourceUid: "prometheus"
+          matcherRegex: "(?i)service[\"=:\\s]*([\\w\\-\\.]+)"
+          name: "ServiceMetrics"
+          url: "/d/service-overview?var-service=$${__value.raw}"
+          urlDisplayLabel: "View Service Metrics"
+          internal: true
+        # Backward compatibility with original simple regex
+        - datasourceUid: "jaeger"
+          matcherRegex: "traceID=(\\w+)"
+          name: "TraceID-Legacy"
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View Trace (Legacy)"
+          internal: true
+        - datasourceUid: "prometheus"
+          matcherRegex: "service=([\\w-]+)"
+          name: "ServiceMetrics-Legacy"
+          url: "/d/service-details?var-service=$${__value.raw}"
+          urlDisplayLabel: "View Service Details"
+          internal: true
+        # Additional correlation fields
+        - datasourceUid: "prometheus"
+          matcherRegex: "(?i)namespace[\"=:\\s]*([\\w\\-\\.]+)"
+          name: "NamespaceMetrics"
+          url: "/d/namespace-overview?var-namespace=$${__value.raw}"
+          urlDisplayLabel: "View Namespace"
+          internal: true
+      # Production log processing settings
+      maxLines: 10000  # Increased for thorough analysis
+      # Comprehensive predefined operations for production monitoring
+      predefinedOperations:
+        - id: "error_logs"
+          label: "Error Logs"
+          query: '{level=~"error|ERROR|fatal|FATAL"}'
+        - id: "warning_logs"
+          label: "Warning Logs"  
+          query: '{level=~"warn|WARNING|warning"}'
+        - id: "service_logs"
+          label: "Service Logs"
+          query: '{service_name=~".+",namespace="voxar-platform"}'
+        - id: "performance_logs"
+          label: "Performance Issues"
+          query: '{} |= "slow|timeout|latency|performance" | json | duration > 1000'
+        - id: "security_logs"
+          label: "Security Events"
+          query: '{} |= "auth|security|unauthorized|forbidden|attack"'
+        - id: "ar_session_logs"
+          label: "AR Session Logs"
+          query: '{service_name=~"localization|vps|mapping"} |= "session_id"'
+        - id: "high_latency"
+          label: "High Latency (Legacy)"
+          query: '{} |= "duration" | json | duration > 1000'
+
+  # OpenTelemetry Collector internal metrics
+  - name: OTEL Collector Metrics
+    type: prometheus
+    access: proxy
+    url: http://otel-collector:8889
+    editable: false  # Production security: prevent unauthorized changes
+    uid: "otel-collector-metrics"
+    jsonData:
+      timeout: 30  # Explicit timeout for internal metrics
+      timeInterval: "30s"  # Appropriate interval for internal metrics
+      queryTimeout: "60s"  # Extended for complex internal queries
+      httpMethod: "GET"
+      customQueryParameters: ""
+      # Internal monitoring settings
+      httpHeaderName1: "X-VOXAR-Internal"
+      disableMetricsLookup: false
+      prometheusType: "Prometheus"
+      prometheusVersion: "2.40.0"
+      # Performance settings for internal metrics
+      keepCookies: []
+      sigV4Auth: false
+
+  # Future AlertManager integration (commented for now)
+  # Uncomment when AlertManager is deployed
+  # - name: AlertManager
+  #   type: alertmanager
+  #   access: proxy
+  #   url: http://alertmanager:9093
+  #   editable: false
+  #   uid: "alertmanager"
+  #   timeout: 30
+  #   jsonData:
+  #     implementation: "prometheus"
+  #     handleGrafanaManagedAlerts: true
+  #   version: 1

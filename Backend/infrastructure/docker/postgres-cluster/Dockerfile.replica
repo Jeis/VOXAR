@@ -1,0 +1,21 @@
+# PostgreSQL Read Replica with Streaming Replication
+FROM postgres:15-alpine
+
+# Install required extensions and tools
+RUN apk add --no-cache \
+    curl \
+    postgresql-contrib
+
+# Create replica setup script
+COPY scripts/setup-replica.sh /docker-entrypoint-initdb.d/
+COPY scripts/pg_hba_replica.conf /tmp/
+COPY scripts/postgresql_replica.conf /tmp/
+
+# Set permissions
+RUN chmod +x /docker-entrypoint-initdb.d/setup-replica.sh
+
+# Health check for replica
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD pg_isready -U postgres || exit 1
+
+EXPOSE 5432

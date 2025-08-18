@@ -1,0 +1,241 @@
+# VOXAR PostgreSQL High Availability Cluster
+# Master-replica setup with automatic failover
+
+version: '3.8'
+
+# =================== CLUSTER NETWORKS ===================
+networks:
+  postgres-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+# =================== CLUSTER VOLUMES ===================
+volumes:
+  postgres_master_data:
+    driver: local
+  postgres_replica_data:
+    driver: local
+  postgres_archive:
+    driver: local
+  postgres_replica_archive:
+    driver: local
+
+services:
+  # =================== POSTGRESQL MASTER ===================
+  
+  postgres-master:
+    build:
+      context: ../postgres-cluster
+      dockerfile: Dockerfile.master
+    container_name: spatial-postgres-master
+    environment:
+      POSTGRES_DB: spatial_platform
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_REPLICA_PASSWORD_FILE: /run/secrets/postgres_replica_password
+      POSTGRES_READER_PASSWORD_FILE: /run/secrets/postgres_reader_password
+    secrets:
+      - postgres_password
+      - postgres_replica_password
+      - postgres_reader_password
+    volumes:
+      - postgres_master_data:/var/lib/postgresql/data
+      - postgres_archive:/var/lib/postgresql/archive
+      - ../../local/sql/init:/docker-entrypoint-initdb.d/migrations:ro
+    ports:
+      - "5432:5432"
+    command: >
+      postgres 
+      -c config_file=/var/lib/postgresql/data/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spatial_platform"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - postgres-cluster
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # =================== POSTGRESQL READ REPLICA ===================
+  
+  postgres-replica:
+    build:
+      context: ../postgres-cluster
+      dockerfile: Dockerfile.replica
+    container_name: spatial-postgres-replica
+    environment:
+      POSTGRES_DB: spatial_platform
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_REPLICA_PASSWORD_FILE: /run/secrets/postgres_replica_password
+      POSTGRES_READER_PASSWORD_FILE: /run/secrets/postgres_reader_password
+    secrets:
+      - postgres_password
+      - postgres_replica_password
+      - postgres_reader_password
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - postgres_replica_archive:/var/lib/postgresql/archive
+    ports:
+      - "5433:5432"
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    command: >
+      postgres 
+      -c config_file=/var/lib/postgresql/data/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spatial_platform"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - postgres-cluster
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # =================== PGBOUNCER CONNECTION POOLER ===================
+  
+  pgbouncer:
+    image: pgbouncer/pgbouncer:latest
+    container_name: spatial-pgbouncer
+    environment:
+      DATABASES_HOST: postgres-master
+      DATABASES_PORT: 5432
+      DATABASES_USER: spatial_admin
+      DATABASES_PASSWORD_FILE: /run/secrets/postgres_password
+      DATABASES_DBNAME: spatial_platform
+      POOL_MODE: transaction
+      SERVER_RESET_QUERY: DISCARD ALL
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 50
+      MIN_POOL_SIZE: 10
+      RESERVE_POOL_SIZE: 10
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+      LOG_CONNECTIONS: 1
+      LOG_DISCONNECTIONS: 1
+      STATS_USERS: spatial_admin
+    secrets:
+      - postgres_password
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "psql", "-h", "localhost", "-U", "spatial_admin", "-d", "pgbouncer", "-c", "SHOW STATS;"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - postgres-cluster
+      - spatial-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  # =================== POSTGRES EXPORTER FOR MONITORING ===================
+  
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: spatial-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://spatial_reader:$(cat /run/secrets/postgres_reader_password)@postgres-master:5432/spatial_platform?sslmode=disable"
+    secrets:
+      - postgres_reader_password
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - postgres-cluster
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+  # =================== BACKUP SERVICE ===================
+  
+  postgres-backup:
+    image: postgres:15-alpine
+    container_name: spatial-postgres-backup
+    environment:
+      POSTGRES_HOST: postgres-master
+      POSTGRES_DB: spatial_platform
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_SCHEDULE: "0 2 * * *"  # Daily at 2 AM
+      BACKUP_RETENTION_DAYS: 30
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_archive:/var/lib/postgresql/archive:ro
+      - ./backups:/backups
+      - ../postgres-cluster/scripts/backup.sh:/backup.sh:ro
+    command: |
+      sh -c '
+        echo "Starting backup service..."
+        echo "$$BACKUP_SCHEDULE /backup.sh" | crontab -
+        crond -f
+      '
+    depends_on:
+      postgres-master:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - postgres-cluster
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+# =================== CLUSTER SECRETS ===================
+secrets:
+  postgres_password:
+    external: true
+  postgres_replica_password:
+    external: true
+  postgres_reader_password:
+    external: true

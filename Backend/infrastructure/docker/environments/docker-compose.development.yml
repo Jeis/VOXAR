@@ -1,0 +1,305 @@
+# VOXAR Development Environment
+# Development-specific overrides and configurations
+
+version: '3.8'
+
+services:
+  # =================== DEVELOPMENT OVERRIDES ===================
+  
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: dev_password_change_me
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    # Development tuning - smaller resources
+    command: >
+      postgres 
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c max_connections=100
+      -c shared_buffers=128MB
+      -c effective_cache_size=512MB
+      -c maintenance_work_mem=32MB
+      -c work_mem=2MB
+      -c log_statement=all
+      -c log_min_duration_statement=100
+
+  redis:
+    environment:
+      - REDIS_PASSWORD=
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 512mb 
+      --maxmemory-policy allkeys-lru
+
+  minio:
+    environment:
+      MINIO_ROOT_USER: spatial_admin
+      MINIO_ROOT_PASSWORD: dev_password_change_me
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  nakama:
+    ports:
+      - "${NAKAMA_GRPC_PORT:-7348}:7348"
+      - "${NAKAMA_WS_PORT:-7349}:7349"
+      - "${NAKAMA_HTTP_PORT:-7350}:7350"
+      - "${NAKAMA_CONSOLE_PORT:-7351}:7351"
+      - "${NAKAMA_METRICS_PORT:-9100}:9100"
+    environment:
+      - POSTGRES_PASSWORD=dev_password_change_me
+      - NAKAMA_CONSOLE_PASSWORD=spatial_console_dev
+      - NAKAMA_HTTP_KEY=nakama_dev_key
+
+  gateway:
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+    # Development volume mounts for hot reload
+    volumes:
+      - ../../api_gateway:/app
+    command: >
+      sh -c "wait-for-it nakama:7350 -t 60 -- 
+             wait-for-it localization:8080 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8000 --reload"
+
+  localization:
+    ports:
+      - "${LOCALIZATION_PORT:-8081}:8080"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql://spatial_admin:dev_password_change_me@postgres:5432/spatial_platform
+      - REDIS_URL=redis://redis:6379/1
+      - MINIO_ACCESS_KEY=spatial_admin
+      - MINIO_SECRET_KEY=dev_password_change_me
+    # Development volume mounts
+    volumes:
+      - ../../localization_service:/app
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8080 --reload"
+
+  # =================== OPTIONAL DEVELOPMENT SERVICES ===================
+  
+  vps-engine:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/vps/Dockerfile
+    container_name: spatial-vps-engine
+    environment:
+      - DATABASE_URL=postgresql://spatial_admin:dev_password_change_me@postgres:5432/spatial_platform
+      - REDIS_URL=redis://redis:6379/6
+      - STORAGE_ENDPOINT=minio:9000
+      - STORAGE_ACCESS_KEY=spatial_admin
+      - STORAGE_SECRET_KEY=dev_password_change_me
+      - STORAGE_BUCKET=vps-maps
+      - JWT_SECRET=dev_jwt_secret_key
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=development
+      - PORT=9000
+    volumes:
+      - ../../vps_maps:/app/vps_maps
+      - ../../cache:/app/cache
+      - ../../vps_engine:/app  # Hot reload
+    ports:
+      - "9002:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             python main.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    profiles:
+      - vps
+      - full
+
+  cloud-anchor-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/cloud-anchor/Dockerfile
+    container_name: spatial-cloud-anchor
+    environment:
+      - DATABASE_URL=postgresql://spatial_admin:dev_password_change_me@postgres:5432/spatial_platform
+      - REDIS_URL=redis://redis:6379/7
+      - JWT_SECRET=dev_jwt_secret_key
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=development
+      - PORT=9001
+    volumes:
+      - ../../cloud_anchor_service:/app  # Hot reload
+    ports:
+      - "9003:9001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             python main.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    profiles:
+      - anchors
+      - full
+
+  mapping-processor:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/mapping/Dockerfile
+    container_name: spatial-mapping-processor
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=postgresql://spatial_admin:dev_password_change_me@postgres:5432/spatial_platform
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=spatial_admin
+      - MINIO_SECRET_KEY=dev_password_change_me
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=development
+      - COLMAP_EXE=/usr/bin/colmap
+    volumes:
+      - mapping_temp:/tmp/mapping
+      - ../../mapping_pipeline:/app  # Hot reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             python -m spatial_mapping.main"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    profiles:
+      - mapping
+      - full
+
+  # =================== DEVELOPMENT OBSERVABILITY ===================
+  
+  # OpenTelemetry Collector - Development mode
+  otel-collector:
+    environment:
+      - ENVIRONMENT=development
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+      - "8888:8888"  # Collector metrics
+      - "8889:8889"  # Prometheus export
+      - "13133:13133" # Health
+      - "55679:55679" # zpages
+    profiles:
+      - observability
+      - full
+
+  # Jaeger - Development access
+  jaeger:
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC
+      - "14268:14268"  # HTTP
+    profiles:
+      - observability
+      - full
+
+  # Loki - Development access
+  loki:
+    ports:
+      - "3100:3100"
+    profiles:
+      - observability
+      - full
+
+  prometheus:
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=spatial_admin_dev
+
+  # =================== DEVELOPMENT TOOLS ===================
+  
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: spatial-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@voxar.io
+      PGADMIN_DEFAULT_PASSWORD: pgadmin_dev
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./configs/pgadmin/servers.json:/pgadmin4/servers.json
+    networks:
+      - spatial-network
+    profiles:
+      - tools
+      - full
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: spatial-redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8082:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - spatial-network
+    profiles:
+      - tools
+      - full

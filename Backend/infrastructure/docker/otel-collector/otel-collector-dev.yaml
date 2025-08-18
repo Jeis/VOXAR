@@ -1,0 +1,103 @@
+# OpenTelemetry Collector Configuration - Development
+# Simplified configuration for development and testing
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+            - "http://127.0.0.1:*"
+
+  prometheus:
+    config:
+      global:
+        scrape_interval: 30s
+      scrape_configs:
+        - job_name: 'spatial-services'
+          static_configs:
+            - targets: 
+              - 'gateway:8000'
+              - 'localization:8080'
+              - 'vps-engine:9000'
+              - 'cloud-anchor-service:9001'
+              - 'mapping-processor:8080'
+          metrics_path: '/metrics'
+          scrape_interval: 15s
+
+processors:
+  memory_limiter:
+    limit_mib: 512
+    spike_limit_mib: 128
+    check_interval: 1s
+
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: "voxar.dev"
+        action: upsert
+      - key: deployment.environment
+        value: "development"
+        action: upsert
+
+  # No sampling in development - see all traces
+  attributes:
+    actions:
+      - key: ar.session.id
+        action: upsert
+        from_attribute: session_id
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: "voxar_dev"
+
+  # Console output for development
+  debug:
+    verbosity: detailed
+    sampling_initial: 1
+    sampling_thereafter: 1
+
+  # File export for local analysis
+  file:
+    path: /tmp/otel/dev-traces.json
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, zpages]
+  
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch, resource]
+      exporters: [prometheus, debug]
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource, attributes]
+      exporters: [debug]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [debug]
+
+  telemetry:
+    logs:
+      level: "debug"
+    metrics:
+      level: detailed

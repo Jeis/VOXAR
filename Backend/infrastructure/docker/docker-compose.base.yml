@@ -1,0 +1,391 @@
+# VOXAR Enterprise Platform - Base Configuration
+# Common services and settings across all environments
+# Override with environment-specific configurations
+
+version: '3.8'
+
+# =================== SHARED NETWORKS ===================
+networks:
+  spatial-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  monitoring:
+    driver: bridge
+    # Allow internet access for plugin downloads
+
+# =================== SHARED VOLUMES ===================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  nakama_data:
+    driver: local
+  mapping_temp:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  nginx_cache:
+    driver: local
+  # OpenTelemetry volumes
+  otel_data:
+    driver: local
+  otel_logs:
+    driver: local
+  jaeger_data:
+    driver: local
+  loki_data:
+    driver: local
+
+# =================== BASE SERVICES ===================
+services:
+  # =================== CORE INFRASTRUCTURE ===================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: spatial-postgres
+    environment:
+      POSTGRES_DB: spatial_platform
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../local/sql/init:/docker-entrypoint-initdb.d
+    command: >
+      postgres 
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spatial_admin -d spatial_platform"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  redis:
+    image: redis:7-alpine
+    container_name: spatial-redis
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 2gb 
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 300
+      --timeout 300
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  minio:
+    image: minio/minio:latest
+    container_name: spatial-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  # =================== MULTIPLAYER CORE ===================
+  
+  nakama:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/nakama/Dockerfile
+    container_name: spatial-nakama
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin
+      - POSTGRES_DB=spatial_platform
+      - MAX_ATTEMPTS=30
+      - POSTGRES_TIMEOUT=5
+      - DEBUG=true
+    entrypoint:
+      - "/bin/bash"
+      - "-ecx"
+      - >
+        echo "Starting Nakama..." &&
+        /usr/local/bin/wait-for-postgres.sh &&
+        /nakama/nakama migrate up --database.address postgres://admin:admin@postgres:5432/spatial_platform?sslmode=disable &&
+        exec /nakama/nakama 
+        --name spatial-ar
+        --database.address postgres://admin:admin@postgres:5432/spatial_platform?sslmode=disable
+        --logger.level INFO
+        --metrics.prometheus_port 9100
+        --console.port 7351
+        --console.username spatial_admin
+        --console.password ${NAKAMA_CONSOLE_PASSWORD:-spatial_console_2024}
+        --session.token_expiry_sec 7200
+        --socket.max_message_size_bytes 8192
+        --runtime.http_key ${NAKAMA_HTTP_KEY:-nakama_http_key}
+    volumes:
+      - ./nakama/modules:/nakama/data/modules:ro
+      - nakama_data:/nakama/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7350/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  # =================== SPATIAL SERVICES ===================
+  
+  gateway:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/api-gateway/Dockerfile
+    container_name: spatial-gateway
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOCALIZATION_SERVICE_URL=http://localization:8080
+      - MAPPING_SERVICE_URL=http://mapping-processor:8080
+      - NAKAMA_SERVICE_URL=http://nakama:7350
+      - VPS_SERVICE_URL=http://vps-engine:9000
+      - CLOUD_ANCHOR_SERVICE_URL=http://cloud-anchor-service:9001
+    depends_on:
+      nakama:
+        condition: service_healthy
+      localization:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it nakama:7350 -t 60 -- 
+             wait-for-it localization:8080 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  localization:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/localization/Dockerfile
+    container_name: spatial-localization
+    environment:
+      - DATABASE_URL=postgresql://admin:admin@postgres:5432/spatial_platform
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-}@redis:6379/1
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-spatial_admin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-dev_password}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8080 --workers 2"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  # =================== OBSERVABILITY STACK ===================
+  
+  # OpenTelemetry Collector
+  otel-collector:
+    build:
+      context: ./otel-collector
+      dockerfile: Dockerfile
+    container_name: spatial-otel-collector
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    volumes:
+      - otel_data:/tmp/otel:rw
+      - otel_logs:/tmp/logs:rw
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+      - "8888:8888"  # Collector metrics
+      - "8889:8889"  # Prometheus metrics export
+      - "13133:13133" # Health check
+      - "55679:55679" # zpages
+    command: 
+      - "--config=/etc/otelcol-contrib/otel-collector-${ENVIRONMENT:-dev}.yaml"
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/otel-collector-dev.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+
+  # Jaeger for distributed tracing
+  jaeger:
+    build:
+      context: ./jaeger
+      dockerfile: Dockerfile
+    container_name: spatial-jaeger
+    environment:
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+      - QUERY_BASE_PATH=/jaeger
+    volumes:
+      - jaeger_data:/badger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC
+      - "14268:14268"  # HTTP
+      - "14269:14269"  # Admin
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:14269/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # Loki for log aggregation
+  loki:
+    build:
+      context: ./loki
+      dockerfile: Dockerfile
+    container_name: spatial-loki
+    volumes:
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: spatial-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - monitoring
+      - spatial-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: spatial-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_PLUGIN_ADMIN_ENABLED=true
+      - GF_PLUGINS_ENABLE_ALPHA=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ../monitoring/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ../monitoring/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

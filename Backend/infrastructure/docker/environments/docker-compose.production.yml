@@ -1,0 +1,436 @@
+# VOXAR Production Environment
+# Production-ready configuration with secrets and TLS
+
+version: '3.8'
+
+# =================== PRODUCTION SECRETS ===================
+secrets:
+  postgres_password:
+    external: true
+  redis_password:
+    external: true
+  nakama_key:
+    external: true
+  nginx_admin_password:
+    external: true
+  minio_access_key:
+    external: true
+  minio_secret_key:
+    external: true
+
+services:
+  # =================== PRODUCTION INFRASTRUCTURE ===================
+  
+  nginx:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/nginx/Dockerfile
+    container_name: spatial-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - nginx_cache:/var/cache/nginx
+      - letsencrypt:/etc/letsencrypt
+      - ../nginx/conf.d:/etc/nginx/conf.d:ro
+    secrets:
+      - nginx_admin_password
+    environment:
+      - ENABLE_CERTBOT=${ENABLE_CERTBOT:-false}
+      - DOMAIN_NAME=${DOMAIN_NAME:-api.voxar.io}
+    depends_on:
+      - gateway
+      - nakama
+      - grafana
+    restart: unless-stopped
+    networks:
+      - spatial-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =================== PRODUCTION DATABASE ===================
+  
+  postgres:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    command: >
+      postgres 
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c max_connections=500
+      -c shared_buffers=1GB
+      -c effective_cache_size=3GB
+      -c maintenance_work_mem=256MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=32MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=8MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c archive_mode=on
+      -c archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  redis:
+    command: >
+      redis-server 
+      --appendonly yes 
+      --requirepass $(cat /run/secrets/redis_password)
+      --maxmemory 4gb 
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 300
+      --timeout 300
+    secrets:
+      - redis_password
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "$(cat /run/secrets/redis_password)", "ping"]
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  minio:
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_access_key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_secret_key
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    secrets:
+      - minio_access_key
+      - minio_secret_key
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # =================== PRODUCTION MULTIPLAYER ===================
+  
+  nakama:
+    entrypoint:
+      - "/bin/sh"
+      - "-ecx"
+      - >
+        echo "Starting Nakama Enterprise..." &&
+        wait-for-it postgres:5432 -t 60 &&
+        /nakama/nakama migrate up --database.address postgres://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform?sslmode=disable &&
+        exec /nakama/nakama 
+        --name spatial-ar-enterprise
+        --database.address postgres://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform?sslmode=disable
+        --logger.level INFO
+        --metrics.prometheus_port 9100
+        --console.port 7351
+        --console.username spatial_admin
+        --console.password $(cat /run/secrets/nginx_admin_password)
+        --session.token_expiry_sec 7200
+        --socket.max_message_size_bytes 8192
+        --runtime.http_key $(cat /run/secrets/nakama_key)
+    secrets:
+      - postgres_password
+      - nginx_admin_password
+      - nakama_key
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # =================== PRODUCTION SPATIAL SERVICES ===================
+  
+  gateway:
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    command: >
+      sh -c "wait-for-it nakama:7350 -t 60 -- 
+             wait-for-it localization:8080 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8000 --workers 8"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  localization:
+    environment:
+      - DATABASE_URL=postgresql://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform
+      - REDIS_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/1
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY_FILE=/run/secrets/minio_access_key
+      - MINIO_SECRET_KEY_FILE=/run/secrets/minio_secret_key
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=production
+    secrets:
+      - postgres_password
+      - redis_password
+      - minio_access_key
+      - minio_secret_key
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             uvicorn app:app --host 0.0.0.0 --port 8080 --workers 4"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  vps-engine:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/vps/Dockerfile
+    container_name: spatial-vps-engine
+    environment:
+      - DATABASE_URL=postgresql://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform
+      - REDIS_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/6
+      - STORAGE_ENDPOINT=minio:9000
+      - STORAGE_ACCESS_KEY_FILE=/run/secrets/minio_access_key
+      - STORAGE_SECRET_KEY_FILE=/run/secrets/minio_secret_key
+      - STORAGE_BUCKET=vps-maps
+      - JWT_SECRET=$(cat /run/secrets/nakama_key)
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=production
+      - PORT=9000
+    secrets:
+      - postgres_password
+      - redis_password
+      - minio_access_key
+      - minio_secret_key
+      - nakama_key
+    volumes:
+      - ./vps_maps:/app/vps_maps
+      - ./cache:/app/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             python main.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 6G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  cloud-anchor-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/cloud-anchor/Dockerfile
+    container_name: spatial-cloud-anchor
+    environment:
+      - DATABASE_URL=postgresql://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform
+      - REDIS_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/7
+      - JWT_SECRET=$(cat /run/secrets/nakama_key)
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=production
+      - PORT=9001
+    secrets:
+      - postgres_password
+      - redis_password
+      - nakama_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             python main.py"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  mapping-processor:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/mapping/Dockerfile
+    container_name: spatial-mapping-processor
+    environment:
+      - CELERY_BROKER_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:$(cat /run/secrets/redis_password)@redis:6379/0
+      - DATABASE_URL=postgresql://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY_FILE=/run/secrets/minio_access_key
+      - MINIO_SECRET_KEY_FILE=/run/secrets/minio_secret_key
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=production
+      - COLMAP_EXE=/usr/bin/colmap
+    secrets:
+      - postgres_password
+      - redis_password
+      - minio_access_key
+      - minio_secret_key
+    volumes:
+      - mapping_temp:/tmp/mapping
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             python -m spatial_mapping.main"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  celery-worker:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/mapping/Dockerfile
+    container_name: spatial-celery-worker
+    command: >
+      sh -c "wait-for-it postgres:5432 -t 60 -- 
+             wait-for-it redis:6379 -t 60 -- 
+             wait-for-it minio:9000 -t 60 -- 
+             celery -A spatial_mapping.celery_app worker --loglevel=info --concurrency=4"
+    environment:
+      - CELERY_BROKER_URL=redis://:$(cat /run/secrets/redis_password)@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:$(cat /run/secrets/redis_password)@redis:6379/0
+      - DATABASE_URL=postgresql://spatial_admin:$(cat /run/secrets/postgres_password)@postgres:5432/spatial_platform
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY_FILE=/run/secrets/minio_access_key
+      - MINIO_SECRET_KEY_FILE=/run/secrets/minio_secret_key
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=production
+      - COLMAP_EXE=/usr/bin/colmap
+    secrets:
+      - postgres_password
+      - redis_password
+      - minio_access_key
+      - minio_secret_key
+    volumes:
+      - mapping_temp:/tmp/mapping
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mapping-processor:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "celery", "-A", "spatial_mapping.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - spatial-network
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # =================== PRODUCTION MONITORING ===================
+  
+  grafana:
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD_FILE=/run/secrets/nginx_admin_password
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_SERVER_DOMAIN=${DOMAIN_NAME:-localhost}
+      - GF_SERVER_ROOT_URL=https://${DOMAIN_NAME:-localhost}/grafana/
+    secrets:
+      - nginx_admin_password
+
+# =================== PRODUCTION VOLUMES ===================
+volumes:
+  letsencrypt:
+    driver: local

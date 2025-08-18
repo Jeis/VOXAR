@@ -1,0 +1,211 @@
+# OpenTelemetry Collector Configuration - Development Environment
+# Optimized for local development with enhanced debugging
+
+receivers:
+  # OTLP receiver for application telemetry
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Prometheus scraping for infrastructure metrics
+  prometheus:
+    config:
+      scrape_configs:
+        # VOXAR Services
+        - job_name: 'api-gateway'
+          static_configs:
+            - targets: ['gateway:8000']
+          metrics_path: '/metrics'
+          scrape_interval: 10s
+          
+        - job_name: 'localization-service'
+          static_configs:
+            - targets: ['localization:8080']
+          metrics_path: '/metrics'
+          scrape_interval: 5s  # Higher frequency for critical service
+          
+        - job_name: 'vps-engine'
+          static_configs:
+            - targets: ['vps-engine:9000']
+          metrics_path: '/metrics'
+          scrape_interval: 15s
+          
+        - job_name: 'cloud-anchors'
+          static_configs:
+            - targets: ['cloud-anchor-service:9001']
+          metrics_path: '/metrics'
+          scrape_interval: 15s
+          
+        # Infrastructure monitoring
+        - job_name: 'postgres'
+          static_configs:
+            - targets: ['postgres:5432']
+          scrape_interval: 30s
+          
+        - job_name: 'redis'
+          static_configs:
+            - targets: ['redis:6379']
+          scrape_interval: 30s
+          
+        - job_name: 'nakama'
+          static_configs:
+            - targets: ['nakama:9100']
+          scrape_interval: 15s
+
+  # Host metrics (for development containers)
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk:
+      network:
+      processes:
+
+processors:
+  # Batch processor for efficient export
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # Memory limiter to prevent OOM
+  memory_limiter:
+    limit_mib: 512
+    spike_limit_mib: 128
+    check_interval: 2s
+
+  # Resource detection
+  resourcedetection:
+    detectors: [env, system, docker]
+    timeout: 5s
+    override: false
+
+  # VOXAR-specific attributes processor
+  attributes:
+    actions:
+      - key: deployment.environment
+        value: development
+        action: upsert
+      - key: voxar.platform.tier
+        value: development
+        action: upsert
+      - key: service.namespace
+        value: voxar.platform
+        action: upsert
+
+  # Filter processor for development debugging
+  filter:
+    traces:
+      span:
+        # Include all spans in development
+        - 'attributes["voxar.service.name"] != nil'
+    metrics:
+      metric:
+        # Include all VOXAR metrics
+        - 'name matches "voxar_.*"'
+        # Include standard HTTP metrics
+        - 'name matches "http_.*"'
+        - 'name matches "system_.*"'
+
+exporters:
+  # OTLP exporter to Jaeger
+  otlp/jaeger:
+    endpoint: http://jaeger:14250
+    tls:
+      insecure: true
+
+  # Prometheus exporter
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: "voxar"
+    send_timestamps: true
+    metric_expiration: 180m
+    enable_open_metrics: true
+
+  # Loki exporter for logs
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    tenant_id: "voxar-dev"
+    labels:
+      attributes:
+        service.name: "service_name"
+        service.version: "service_version"
+        deployment.environment: "env"
+      resource:
+        service.name: "service_name"
+        service.namespace: "service_namespace"
+
+  # Console exporter for development debugging
+  logging:
+    loglevel: debug
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # Debug exporter for troubleshooting
+  debug:
+    verbosity: detailed
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  # Health check extension
+  health_check:
+    endpoint: 0.0.0.0:13133
+    
+  # Performance profiler
+  pprof:
+    endpoint: 0.0.0.0:1777
+    
+  # zPages for debugging
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+  # Memory ballast for stable performance
+  memory_ballast:
+    size_mib: 165
+
+service:
+  extensions: [health_check, pprof, zpages, memory_ballast]
+  
+  pipelines:
+    # Traces pipeline
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, attributes, batch]
+      exporters: [otlp/jaeger, logging]
+    
+    # Metrics pipeline  
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics]
+      processors: [memory_limiter, resourcedetection, attributes, filter, batch]
+      exporters: [prometheus, logging]
+    
+    # Logs pipeline
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, attributes, batch]
+      exporters: [loki, logging]
+
+  # Telemetry configuration
+  telemetry:
+    logs:
+      level: "debug"
+      development: true
+      sampling:
+        initial: 5
+        thereafter: 200
+    metrics:
+      level: "detailed"
+      address: 0.0.0.0:8888
+    traces:
+      level: "detailed"

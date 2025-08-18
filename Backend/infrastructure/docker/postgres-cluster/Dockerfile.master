@@ -1,0 +1,21 @@
+# PostgreSQL Master Node with Streaming Replication
+FROM postgres:15-alpine
+
+# Install required extensions and tools
+RUN apk add --no-cache \
+    curl \
+    postgresql-contrib
+
+# Create replication user script
+COPY scripts/setup-master.sh /docker-entrypoint-initdb.d/
+COPY scripts/pg_hba_master.conf /tmp/
+COPY scripts/postgresql_master.conf /tmp/
+
+# Set permissions
+RUN chmod +x /docker-entrypoint-initdb.d/setup-master.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD pg_isready -U postgres || exit 1
+
+EXPOSE 5432
